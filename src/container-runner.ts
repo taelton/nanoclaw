@@ -61,6 +61,7 @@ interface VolumeMount {
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  chatJid: string,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -189,10 +190,20 @@ function buildVolumeMounts(
   const groupIpcDir = resolveGroupIpcPath(group.folder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  // Per-chatJid input dir so concurrent containers for the same group folder
+  // (e.g. group chat + DM to the same bot) don't share an input namespace.
+  const safeJid = chatJid.replace(/[^a-zA-Z0-9]/g, '-');
+  const chatInputDir = path.join(groupIpcDir, `input-${safeJid}`);
+  fs.mkdirSync(chatInputDir, { recursive: true });
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
+    readonly: false,
+  });
+  // Overlay: mount chatJid-specific input dir over the shared group input path
+  mounts.push({
+    hostPath: chatInputDir,
+    containerPath: '/workspace/ipc/input',
     readonly: false,
   });
 
@@ -304,7 +315,7 @@ export async function runContainerAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  const mounts = buildVolumeMounts(group, input.isMain, input.chatJid);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   // Main group uses the default OneCLI agent; others use their own agent.

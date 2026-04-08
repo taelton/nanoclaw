@@ -1,0 +1,1 @@
+../skills/qodo-pr-resolver/SKILL.md

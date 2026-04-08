@@ -1,0 +1,1 @@
+../skills/add-pdf-reader/SKILL.md

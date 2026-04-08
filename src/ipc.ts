@@ -4,7 +4,8 @@ import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
-import { sendPoolMessage } from './channels/telegram.js';
+import { readEnvFile } from './env.js';
+import { sendPoolMessage, sendWithDedicatedToken } from './channels/telegram.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
@@ -82,7 +83,12 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  if (data.sender && data.chatJid.startsWith('tg:')) {
+                  const dedicatedToken = targetGroup?.telegramSendBotToken;
+                  if (dedicatedToken && data.chatJid.startsWith('tg:')) {
+                    // Persistent agent with a pinned bot identity — never renamed, never shared
+                    await sendWithDedicatedToken(data.chatJid, data.text, dedicatedToken);
+                  } else if (data.sender && data.chatJid.startsWith('tg:')) {
+                    // Ephemeral swarm agent — use pool (round-robin, renamed per sender)
                     await sendPoolMessage(
                       data.chatJid,
                       data.text,
@@ -183,6 +189,7 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    telegramSendBotToken?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -455,6 +462,12 @@ export async function processTaskIpc(
         // Preserve isMain from the existing registration so IPC config
         // updates (e.g. adding additionalMounts) don't strip the flag.
         const existingGroup = registeredGroups[data.jid];
+        // Resolve env var name to actual token value so raw tokens never travel through IPC
+        let resolvedToken = data.telegramSendBotToken;
+        if (resolvedToken && /^[A-Z][A-Z0-9_]*$/.test(resolvedToken)) {
+          const envVars = readEnvFile([resolvedToken]);
+          resolvedToken = process.env[resolvedToken] || envVars[resolvedToken] || resolvedToken;
+        }
         deps.registerGroup(data.jid, {
           name: data.name,
           folder: data.folder,
@@ -463,6 +476,7 @@ export async function processTaskIpc(
           containerConfig: data.containerConfig,
           requiresTrigger: data.requiresTrigger,
           isMain: existingGroup?.isMain,
+          telegramSendBotToken: resolvedToken,
         });
       } else {
         logger.warn(

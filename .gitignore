@@ -36,3 +36,6 @@ groups/global/*
 .nanoclaw/
 
 agents-sdk-docs
+
+# Shared data (may contain sensitive financial/personal data)
+shared-data/

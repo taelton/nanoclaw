@@ -1,0 +1,1 @@
+../skills/add-compact/SKILL.md

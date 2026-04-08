@@ -1,0 +1,1 @@
+../skills/add-slack/SKILL.md

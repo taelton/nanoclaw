@@ -70,7 +70,7 @@ function createSchema(database: Database.Database): void {
       value TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS sessions (
-      group_folder TEXT PRIMARY KEY,
+      chat_jid TEXT PRIMARY KEY,
       session_id TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS registered_groups (
@@ -124,6 +124,39 @@ function createSchema(database: Database.Database): void {
     );
   } catch {
     /* column already exists */
+  }
+
+  // Add telegram_send_bot_token column if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(
+      `ALTER TABLE registered_groups ADD COLUMN telegram_send_bot_token TEXT`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  // Migrate sessions table from group_folder key to chat_jid key
+  try {
+    const cols = database
+      .prepare('PRAGMA table_info(sessions)')
+      .all() as Array<{ name: string }>;
+    const hasGroupFolder = cols.some((c) => c.name === 'group_folder');
+    if (hasGroupFolder) {
+      database.exec(`
+        CREATE TABLE sessions_new (
+          chat_jid TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL
+        );
+        INSERT INTO sessions_new (chat_jid, session_id)
+          SELECT rg.jid, s.session_id
+          FROM sessions s
+          JOIN registered_groups rg ON rg.folder = s.group_folder;
+        DROP TABLE sessions;
+        ALTER TABLE sessions_new RENAME TO sessions;
+      `);
+    }
+  } catch {
+    /* migration failed — sessions will be fresh */
   }
 
   // Add channel and is_group columns if they don't exist (migration for existing DBs)
@@ -564,30 +597,30 @@ export function setRouterState(key: string, value: string): void {
 
 // --- Session accessors ---
 
-export function getSession(groupFolder: string): string | undefined {
+export function getSession(chatJid: string): string | undefined {
   const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
-    .get(groupFolder) as { session_id: string } | undefined;
+    .prepare('SELECT session_id FROM sessions WHERE chat_jid = ?')
+    .get(chatJid) as { session_id: string } | undefined;
   return row?.session_id;
 }
 
-export function setSession(groupFolder: string, sessionId: string): void {
+export function setSession(chatJid: string, sessionId: string): void {
   db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
-  ).run(groupFolder, sessionId);
+    'INSERT OR REPLACE INTO sessions (chat_jid, session_id) VALUES (?, ?)',
+  ).run(chatJid, sessionId);
 }
 
-export function deleteSession(groupFolder: string): void {
-  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+export function deleteSession(chatJid: string): void {
+  db.prepare('DELETE FROM sessions WHERE chat_jid = ?').run(chatJid);
 }
 
 export function getAllSessions(): Record<string, string> {
   const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions')
-    .all() as Array<{ group_folder: string; session_id: string }>;
+    .prepare('SELECT chat_jid, session_id FROM sessions')
+    .all() as Array<{ chat_jid: string; session_id: string }>;
   const result: Record<string, string> = {};
   for (const row of rows) {
-    result[row.group_folder] = row.session_id;
+    result[row.chat_jid] = row.session_id;
   }
   return result;
 }
@@ -609,6 +642,7 @@ export function getRegisteredGroup(
         container_config: string | null;
         requires_trigger: number | null;
         is_main: number | null;
+        telegram_send_bot_token: string | null;
       }
     | undefined;
   if (!row) return undefined;
@@ -631,6 +665,7 @@ export function getRegisteredGroup(
     requiresTrigger:
       row.requires_trigger === null ? undefined : row.requires_trigger === 1,
     isMain: row.is_main === 1 ? true : undefined,
+    telegramSendBotToken: row.telegram_send_bot_token ?? undefined,
   };
 }
 
@@ -639,8 +674,8 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main, telegram_send_bot_token)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -650,6 +685,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.containerConfig ? JSON.stringify(group.containerConfig) : null,
     group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
     group.isMain ? 1 : 0,
+    group.telegramSendBotToken ?? null,
   );
 }
 
@@ -663,6 +699,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     container_config: string | null;
     requires_trigger: number | null;
     is_main: number | null;
+    telegram_send_bot_token: string | null;
   }>;
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
@@ -684,6 +721,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       requiresTrigger:
         row.requires_trigger === null ? undefined : row.requires_trigger === 1,
       isMain: row.is_main === 1 ? true : undefined,
+      telegramSendBotToken: row.telegram_send_bot_token ?? undefined,
     };
   }
   return result;

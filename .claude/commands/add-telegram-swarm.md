@@ -1,0 +1,1 @@
+../skills/add-telegram-swarm/SKILL.md

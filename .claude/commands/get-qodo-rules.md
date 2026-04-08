@@ -1,0 +1,1 @@
+../skills/get-qodo-rules/SKILL.md

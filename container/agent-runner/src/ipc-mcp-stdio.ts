@@ -466,6 +466,12 @@ Use available_groups.json to find the JID for a group. The folder name must be c
       .describe(
         'Whether messages must start with the trigger word. Default: false (respond to all messages). Set to true for busy groups with many participants where you only want the agent to respond when explicitly mentioned.',
       ),
+    telegramSendBotToken: z
+      .string()
+      .optional()
+      .describe(
+        'Optional: env var name holding the dedicated Telegram bot token for this group (e.g., "TELEGRAM_BOT_TOKEN_FINN"). The token is resolved by NanoClaw at registration time — never pass the raw token value.',
+      ),
   },
   async (args) => {
     if (!isMain) {
@@ -487,6 +493,7 @@ Use available_groups.json to find the JID for a group. The folder name must be c
       folder: args.folder,
       trigger: args.trigger,
       requiresTrigger: args.requiresTrigger ?? false,
+      telegramSendBotToken: args.telegramSendBotToken,
       timestamp: new Date().toISOString(),
     };
 

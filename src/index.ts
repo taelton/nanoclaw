@@ -15,7 +15,7 @@ import {
   TELEGRAM_BOT_POOL,
   TIMEZONE,
 } from './config.js';
-import { initBotPool } from './channels/telegram.js';
+import { initBotPool, startGroupPolling, sendWithDedicatedToken } from './channels/telegram.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -82,6 +82,37 @@ const channels: Channel[] = [];
 const queue = new GroupQueue();
 
 const onecli = new OneCLI({ url: ONECLI_URL });
+
+// In-memory map for synthetic DM JIDs (e.g. tg:<botId>_<userId> → canonical group).
+// NOT persisted to DB — avoids collisions on the unique `folder` constraint.
+// Re-populated on demand when the first DM arrives after a restart.
+const dynamicJidMap = new Map<string, RegisteredGroup>();
+
+/**
+ * Look up a registered group by JID, falling back to the dynamic DM map.
+ */
+function lookupGroup(chatJid: string): RegisteredGroup | undefined {
+  return registeredGroups[chatJid] ?? dynamicJidMap.get(chatJid);
+}
+
+/**
+ * Send a message to a group, using its dedicated bot token if present.
+ * Falls back to the main channel bot for groups without a dedicated token.
+ */
+async function sendToGroup(chatJid: string, text: string): Promise<void> {
+  const group = lookupGroup(chatJid);
+  const token = group?.telegramSendBotToken;
+  if (token && chatJid.startsWith('tg:')) {
+    await sendWithDedicatedToken(chatJid, text, token);
+  } else {
+    const channel = findChannel(channels, chatJid);
+    if (!channel) {
+      logger.warn({ chatJid }, 'No channel owns JID, cannot send message');
+      return;
+    }
+    await channel.sendMessage(chatJid, text);
+  }
+}
 
 function ensureOneCLIAgent(jid: string, group: RegisteredGroup): void {
   if (group.isMain) return;
@@ -222,7 +253,7 @@ export function _setRegisteredGroups(
  * Called by the GroupQueue when it's this group's turn.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
+  const group = lookupGroup(chatJid);
   if (!group) return true;
 
   const channel = findChannel(channels, chatJid);
@@ -282,7 +313,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
+  // Skip typing indicator for groups with a dedicated token (main bot isn't in those chats)
+  if (!group.telegramSendBotToken) {
+    await channel.setTyping?.(chatJid, true);
+  }
   let hadError = false;
   let outputSentToUser = false;
 
@@ -297,7 +331,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        await sendToGroup(chatJid, text);
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -313,7 +347,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
-  await channel.setTyping?.(chatJid, false);
+  if (!group.telegramSendBotToken) {
+    await channel.setTyping?.(chatJid, false);
+  }
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -346,7 +382,7 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  const sessionId = sessions[chatJid];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -378,8 +414,8 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          sessions[chatJid] = output.newSessionId;
+          setSession(chatJid, output.newSessionId);
         }
         await onOutput(output);
       }
@@ -402,8 +438,8 @@ async function runAgent(
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      sessions[chatJid] = output.newSessionId;
+      setSession(chatJid, output.newSessionId);
     }
 
     if (output.status === 'error') {
@@ -423,8 +459,8 @@ async function runAgent(
           { group: group.name, staleSessionId: sessionId, error: output.error },
           'Stale session detected — clearing for next retry',
         );
-        delete sessions[group.folder];
-        deleteSession(group.folder);
+        delete sessions[chatJid];
+        deleteSession(chatJid);
       }
 
       logger.error(
@@ -452,7 +488,7 @@ async function startMessageLoop(): Promise<void> {
 
   while (true) {
     try {
-      const jids = Object.keys(registeredGroups);
+      const jids = [...Object.keys(registeredGroups), ...dynamicJidMap.keys()];
       const { messages, newTimestamp } = getNewMessages(
         jids,
         lastTimestamp,
@@ -478,7 +514,7 @@ async function startMessageLoop(): Promise<void> {
         }
 
         for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
+          const group = lookupGroup(chatJid);
           if (!group) continue;
 
           const channel = findChannel(channels, chatJid);
@@ -525,12 +561,14 @@ async function startMessageLoop(): Promise<void> {
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
-            // Show typing indicator while the container processes the piped message
-            channel
-              .setTyping?.(chatJid, true)
-              ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-              );
+            // Show typing indicator (skip for groups with dedicated token — main bot isn't in those chats)
+            if (!lookupGroup(chatJid)?.telegramSendBotToken) {
+              channel
+                .setTyping?.(chatJid, true)
+                ?.catch((err) =>
+                  logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
+                );
+            }
           } else {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -702,6 +740,20 @@ async function main(): Promise<void> {
     await initBotPool(TELEGRAM_BOT_POOL);
   }
 
+  // Start dedicated polling for groups with their own bot tokens
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (group.telegramSendBotToken && jid.startsWith('tg:')) {
+      await startGroupPolling(group.telegramSendBotToken, jid, channelOpts, (syntheticJid) => {
+        if (!dynamicJidMap.has(syntheticJid)) {
+          dynamicJidMap.set(syntheticJid, { ...group });
+          // Clear cursor so the triggering message is guaranteed to be picked up
+          delete lastAgentTimestamp[syntheticJid];
+          logger.info({ syntheticJid, groupName: group.name }, 'Registered DM JID for dedicated-token group');
+        }
+      });
+    }
+  }
+
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
@@ -710,15 +762,38 @@ async function main(): Promise<void> {
     onProcess: (groupJid, proc, containerName, groupFolder) =>
       queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) {
-        logger.warn({ jid }, 'No channel owns JID, cannot send message');
-        return;
+      const grp = lookupGroup(jid);
+      const token = grp?.telegramSendBotToken;
+      if (token && jid.startsWith('tg:')) {
+        const text = formatOutbound(rawText, 'telegram' as ChannelType);
+        if (text) await sendWithDedicatedToken(jid, text, token);
+      } else {
+        const channel = findChannel(channels, jid);
+        if (!channel) {
+          logger.warn({ jid }, 'No channel owns JID, cannot send message');
+          return;
+        }
+        const text = formatOutbound(rawText, channel.name as ChannelType);
+        if (text) await channel.sendMessage(jid, text);
       }
-      const text = formatOutbound(rawText, channel.name as ChannelType);
-      if (text) await channel.sendMessage(jid, text);
     },
   });
+  // Wrapper that also starts dedicated polling for newly registered groups
+  const registerGroupWithPolling = (jid: string, group: RegisteredGroup) => {
+    registerGroup(jid, group);
+    if (group.telegramSendBotToken && jid.startsWith('tg:')) {
+      startGroupPolling(group.telegramSendBotToken, jid, channelOpts, (syntheticJid) => {
+        if (!dynamicJidMap.has(syntheticJid)) {
+          dynamicJidMap.set(syntheticJid, { ...group });
+          delete lastAgentTimestamp[syntheticJid];
+          logger.info({ syntheticJid, groupName: group.name }, 'Registered DM JID for dedicated-token group');
+        }
+      }).catch(
+        (err) => logger.error({ err, jid }, 'Failed to start group polling after registration'),
+      );
+    }
+  };
+
   startIpcWatcher({
     sendMessage: (jid, rawText) => {
       const channel = findChannel(channels, jid);
@@ -728,7 +803,7 @@ async function main(): Promise<void> {
       return channel.sendMessage(jid, text);
     },
     registeredGroups: () => registeredGroups,
-    registerGroup,
+    registerGroup: registerGroupWithPolling,
     syncGroups: async (force: boolean) => {
       await Promise.all(
         channels

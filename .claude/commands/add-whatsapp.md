@@ -1,0 +1,1 @@
+../skills/add-whatsapp/SKILL.md

@@ -1,0 +1,1 @@
+../skills/add-ollama-tool/SKILL.md
