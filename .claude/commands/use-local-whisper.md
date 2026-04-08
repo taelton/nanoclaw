@@ -1,1 +1,0 @@
-../skills/use-local-whisper/SKILL.md

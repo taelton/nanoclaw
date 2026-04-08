@@ -1,1 +1,0 @@
-../skills/add-parallel/SKILL.md

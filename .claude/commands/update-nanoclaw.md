@@ -1,1 +1,0 @@
-../skills/update-nanoclaw/SKILL.md

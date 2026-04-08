@@ -1,1 +1,0 @@
-../skills/add-telegram/SKILL.md

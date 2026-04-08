@@ -1,1 +1,0 @@
-../skills/add-voice-transcription/SKILL.md

@@ -1,1 +1,0 @@
-../skills/add-discord/SKILL.md

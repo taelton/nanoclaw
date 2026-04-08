@@ -1,1 +1,0 @@
-../skills/migrate-nanoclaw/SKILL.md

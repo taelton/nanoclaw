@@ -1,1 +1,0 @@
-../skills/x-integration/SKILL.md

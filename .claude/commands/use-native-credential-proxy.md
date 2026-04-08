@@ -1,1 +1,0 @@
-../skills/use-native-credential-proxy/SKILL.md
